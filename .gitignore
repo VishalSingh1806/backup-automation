@@ -1,0 +1,4 @@
+drive-audit-service.json
+__pycache__/
+*.pyc
+.env
