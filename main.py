@@ -7,7 +7,9 @@ from googleapiclient.discovery import build
 
 app = FastAPI()
 
-SERVICE_ACCOUNT_FILE = r"D:\Admin-workspace\drive-audit-service.json"
+
+#SERVICE_ACCOUNT_FILE = r"D:\Admin-workspace\drive-audit-service.json"
+SERVICE_ACCOUNT_FILE = F"/home/apps/backup-automation/drive-audit-service.json"
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
 class AuditRequest(BaseModel):
