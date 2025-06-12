@@ -5,7 +5,8 @@ import time
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -14,6 +15,9 @@ app = FastAPI()
 # Setup download directory
 DOWNLOAD_DIR = "/home/apps/backup-automation/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Mount static file serving for actual downloads
+app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
 
 # Service account setup
 SERVICE_ACCOUNT_FILE = "/home/apps/backup-automation/drive-audit-service.json"
@@ -69,26 +73,31 @@ def audit_user(request: AuditRequest):
 
     schedule_file_deletion(file_path, delay=300)  # Auto-delete after 5 mins
 
-    return JSONResponse(content={
+    return {
         "status": "success",
         "file_id": file_id,
         "download_link": f"http://35.202.229.82:8000/download/{file_id}"
-    })
+    }
 
 @app.get("/download/{file_id}")
-def download_file(file_id: str):
+def download_page(file_id: str):
     file_name = f"shared_files_{file_id}.csv"
     file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(
-        path=file_path,
-        filename=file_name,
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{file_name}"'}
-    )
+    html = f"""
+    <html>
+      <head>
+        <meta http-equiv=\"refresh\" content=\"0; url=/files/{file_name}\">
+      </head>
+      <body>
+        <p>If your file did not start downloading, <a href='/files/{file_name}'>click here</a>.</p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 @app.get("/")
 def root():
