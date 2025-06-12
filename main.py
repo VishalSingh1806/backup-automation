@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -68,6 +68,20 @@ def audit_user(request: AuditRequest):
             ])
 
     schedule_file_deletion(file_path, delay=300)  # Auto-delete after 5 mins
+
+    return JSONResponse(content={
+        "status": "success",
+        "file_id": file_id,
+        "download_link": f"http://35.202.229.82:8000/download/{file_id}"
+    })
+
+@app.get("/download/{file_id}")
+def download_file(file_id: str):
+    file_name = f"shared_files_{file_id}.csv"
+    file_path = os.path.join(DOWNLOAD_DIR, file_name)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(
         path=file_path,
