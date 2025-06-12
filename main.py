@@ -1,15 +1,22 @@
 import csv
-from fastapi import FastAPI, Request
+import os
+from datetime import datetime
+from fastapi import FastAPI
 from pydantic import BaseModel
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = FastAPI()
 
+# Mount downloads directory to serve files
+DOWNLOAD_DIR = "/home/apps/backup-automation/downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
-#SERVICE_ACCOUNT_FILE = r"D:\Admin-workspace\drive-audit-service.json"
-SERVICE_ACCOUNT_FILE = F"/home/apps/backup-automation/drive-audit-service.json"
+# Google credentials
+SERVICE_ACCOUNT_FILE = "/home/apps/backup-automation/drive-audit-service.json"
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
 class AuditRequest(BaseModel):
@@ -18,6 +25,9 @@ class AuditRequest(BaseModel):
 @app.post("/audit-user")
 def audit_user(request: AuditRequest):
     user_email = request.user_email
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    file_name = f"shared_files_{user_email.replace('@', '_')}_{timestamp}.csv"
+    file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
     credentials = service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_FILE,
@@ -35,10 +45,9 @@ def audit_user(request: AuditRequest):
     ).execute()
 
     files = results.get('files', [])
-    file_name = f'shared_files_{user_email.replace("@", "_")}.csv'
-
     headers = ["File Name", "File ID", "Owner"]
-    with open(file_name, mode='w', newline='', encoding='utf-8') as file_out:
+
+    with open(file_path, mode='w', newline='', encoding='utf-8') as file_out:
         writer = csv.writer(file_out)
         writer.writerow(headers)
         for file in files:
@@ -48,7 +57,8 @@ def audit_user(request: AuditRequest):
                 file['owners'][0]['emailAddress']
             ])
 
-    return FileResponse(file_name, filename=file_name)
+    public_url = f"http://35.202.229.82:8000/downloads/{file_name}"
+    return JSONResponse(content={"status": "success", "download_url": public_url})
 
 @app.get("/")
 def root():
