@@ -87,13 +87,23 @@ def download_page(file_id: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Trigger auto-download immediately
     html = f"""
     <html>
       <head>
-        <meta http-equiv=\"refresh\" content=\"0; url=/files/{file_name}\">
+        <script>
+          window.onload = function() {{
+            const link = document.createElement('a');
+            link.href = '/files/{file_name}';
+            link.download = '{file_name}';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+          }};
+        </script>
       </head>
       <body>
-        <p>If your file did not start downloading, <a href='/files/{file_name}'>click here</a>.</p>
+        <p>If your file did not start downloading automatically, <a href='/files/{file_name}'>click here</a>.</p>
       </body>
     </html>
     """
