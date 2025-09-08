@@ -17,13 +17,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp")
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "./drive-audit-service.json")
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 EXTERNAL_BASE_URL = os.getenv("EXTERNAL_BASE_URL")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
+if os.path.exists(DOWNLOAD_DIR):
+    app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
+else:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
 security = HTTPBearer(auto_error=False)
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
