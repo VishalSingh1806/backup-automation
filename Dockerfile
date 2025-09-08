@@ -8,7 +8,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
-RUN mkdir -p /app/downloads && chmod 777 /app/downloads && chown -R app:app /app
+RUN chown -R app:app /app
+
+# Create downloads with proper permissions
+RUN mkdir -p /app/downloads && chmod 755 /app/downloads
 
 USER app
 EXPOSE 8000
