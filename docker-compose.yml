@@ -1,10 +1,8 @@
-version: '3.8'
-
 services:
   drive-audit-api:
     build: .
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       - DOWNLOAD_DIR=/app/downloads
       - SERVICE_ACCOUNT_FILE=/app/drive-audit-service.json

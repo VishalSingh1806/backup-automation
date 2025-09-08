@@ -42,8 +42,8 @@ docker compose up -d
 echo "Waiting for service..."
 sleep 10
 
-if curl -f http://localhost:8000/health > /dev/null 2>&1; then
-    echo "Deployment successful! API running at http://localhost:8000"
+if curl -f http://localhost:8001/health > /dev/null 2>&1; then
+    echo "Deployment successful! API running at http://localhost:8001"
 else
     echo "Health check failed. Check logs: docker compose logs"
     exit 1
