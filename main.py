@@ -3,288 +3,311 @@ import os
 import threading
 import time
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+import logging
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-app = FastAPI()
+app = FastAPI(title="Google Drive Audit API", version="1.0.0")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Setup download directory
-DOWNLOAD_DIR = "/home/apps/backup-automation/downloads"
+# Configuration
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads")
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "./drive-audit-service.json")
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
+EXTERNAL_BASE_URL = os.getenv("EXTERNAL_BASE_URL")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Mount static file serving for actual downloads
 app.mount("/files", StaticFiles(directory=DOWNLOAD_DIR), name="files")
-
-# Service account setup
-SERVICE_ACCOUNT_FILE = "/home/apps/backup-automation/drive-audit-service.json"
+security = HTTPBearer(auto_error=False)
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# ─── Models ────────────────────────────────────────────────────────────────────
+def verify_bearer_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not API_BEARER_TOKEN:
+        return True
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    if credentials.credentials != API_BEARER_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token")
+    return True
+
 class AuditRequest(BaseModel):
-    user_email: str
+    user_email: EmailStr
 
 class TransferRequest(BaseModel):
-    from_email: str
-    to_email: str
-    transfer_type: str  # 'backup' or 'direct'
+    from_email: EmailStr
+    to_email: EmailStr
+    transfer_type: str = "direct"
 
 class ReplaceShareRequest(BaseModel):
-    from_email: str
-    to_email: str
+    from_email: EmailStr
+    to_email: EmailStr
 
 class SingleFileTransferRequest(BaseModel):
     file_id: str
-    from_email: str
-    to_email: str
+    from_email: EmailStr
+    to_email: EmailStr
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
 def schedule_file_deletion(path, delay=300):
     def delete_file():
-        time.sleep(delay)
-        if os.path.exists(path):
-            os.remove(path)
+        try:
+            time.sleep(delay)
+            if os.path.exists(path):
+                os.remove(path)
+                logger.info(f"Deleted temporary file: {path}")
+        except Exception as e:
+            logger.error(f"Failed to delete file {path}: {e}")
     threading.Thread(target=delete_file, daemon=True).start()
 
-def recursively_transfer(service, file_id, to_email, processed, errors):
-    """Transfer ownership of a file/folder and all its children."""
+def get_drive_service(user_email):
     try:
-        file = service.files().get(
-            fileId=file_id,
-            fields="id, name, mimeType"
-        ).execute()
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES, subject=user_email
+        )
+        return build('drive', 'v3', credentials=credentials)
+    except Exception as e:
+        logger.error(f"Failed to create Drive service for {user_email}: {e}")
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
-        # Transfer this item
+def recursively_transfer(service, file_id, to_email, processed, errors):
+    try:
+        file = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        
         service.permissions().create(
             fileId=file_id,
-            body={
-                'type': 'user',
-                'role': 'owner',
-                'transferOwnership': True,
-                'emailAddress': to_email
-            },
+            body={'type': 'user', 'role': 'owner', 'transferOwnership': True, 'emailAddress': to_email},
             transferOwnership=True
         ).execute()
         processed.append(file_id)
+        logger.info(f"Transferred {file['name']} to {to_email}")
 
-        # If it's a folder, recurse into its contents
         if file['mimeType'] == 'application/vnd.google-apps.folder':
             page_token = None
             while True:
                 children = service.files().list(
                     q=f"'{file_id}' in parents and trashed = false",
-                    fields="nextPageToken, files(id)",
-                    pageToken=page_token
+                    fields="nextPageToken, files(id)", pageToken=page_token
                 ).execute()
-
+                
                 for child in children.get('files', []):
                     recursively_transfer(service, child['id'], to_email, processed, errors)
-
+                
                 page_token = children.get('nextPageToken')
                 if not page_token:
                     break
-
     except Exception as e:
+        logger.error(f"Transfer failed for {file_id}: {e}")
         errors.append({"file_id": file_id, "error": str(e)})
 
-# ─── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"status": "healthy", "service": "Google Drive Audit API"}
+
+@app.get("/health")
+def health_check():
+    checks = {
+        "service_account_file": os.path.exists(SERVICE_ACCOUNT_FILE),
+        "download_directory": os.path.exists(DOWNLOAD_DIR),
+        "bearer_token_configured": bool(API_BEARER_TOKEN)
+    }
+    return {
+        "status": "healthy" if all(checks.values()) else "unhealthy",
+        "checks": checks,
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.post("/audit-user")
-def audit_user(request: AuditRequest):
-    user_email = request.user_email
-    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    file_id = f"{user_email.replace('@', '_')}_{timestamp}"
-    file_name = f"shared_files_{file_id}.csv"
-    file_path = os.path.join(DOWNLOAD_DIR, file_name)
+def audit_user(request: AuditRequest, http_request: Request, _: bool = Depends(verify_bearer_token)):
+    try:
+        user_email = request.user_email
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        file_id = f"{user_email.replace('@', '_')}_{timestamp}"
+        file_name = f"shared_files_{file_id}.csv"
+        file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES,
-        subject=user_email
-    )
-    service = build('drive', 'v3', credentials=credentials)
+        service = get_drive_service(user_email)
+        query = f"('{user_email}' in readers or '{user_email}' in writers) and not '{user_email}' in owners and trashed = false"
+        total_files = 0
+        
+        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["File Name", "File ID", "Owner", "Type", "Last Modified"])
+            page_token = None
+            
+            while True:
+                results = service.files().list(
+                    q=query, pageSize=100,
+                    fields="nextPageToken, files(id, name, owners, mimeType, modifiedTime)",
+                    pageToken=page_token
+                ).execute()
+                
+                for file in results.get('files', []):
+                    writer.writerow([
+                        file.get('name', ''),
+                        file.get('id', ''),
+                        (file.get('owners') or [{}])[0].get('emailAddress', ''),
+                        file.get('mimeType', ''),
+                        file.get('modifiedTime', '')
+                    ])
+                    total_files += 1
+                
+                page_token = results.get('nextPageToken')
+                if not page_token:
+                    break
 
-    query = (
-        f"('{user_email}' in readers or '{user_email}' in writers) "
-        f"and not '{user_email}' in owners and trashed = false"
-    )
-    results = service.files().list(
-        q=query,
-        pageSize=100,
-        fields="nextPageToken, files(id, name, owners)"
-    ).execute()
+        schedule_file_deletion(file_path, delay=300)
 
-    files = results.get('files', [])
-    with open(file_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(["File Name", "File ID", "Owner"])
-        for file in files:
-            writer.writerow([
-                file['name'],
-                file['id'],
-                file['owners'][0]['emailAddress']
-            ])
-
-    schedule_file_deletion(file_path, delay=300)
-
-    return {
-        "status": "success",
-        "file_id": file_id,
-        "download_link": f"http://35.202.229.82:8000/download/{file_id}"
-    }
+        base_url = EXTERNAL_BASE_URL.rstrip('/') if EXTERNAL_BASE_URL else f"{http_request.url.scheme}://{http_request.headers.get('host', http_request.url.netloc)}"
+        
+        logger.info(f"Audit completed for {user_email}: {total_files} files")
+        return {
+            "status": "success",
+            "file_id": file_id,
+            "total_files": total_files,
+            "download_link": f"{base_url}/download/{file_id}"
+        }
+    except Exception as e:
+        logger.error(f"Audit failed for {user_email}: {e}")
+        raise HTTPException(status_code=500, detail=f"Audit failed: {str(e)}")
 
 @app.post("/transfer-owned-files")
-def transfer_owned_files(request: TransferRequest):
-    from_email = request.from_email
-    to_email = request.to_email
+def transfer_owned_files(request: TransferRequest, _: bool = Depends(verify_bearer_token)):
+    try:
+        service = get_drive_service(request.from_email)
+        folder = service.files().create(
+            body={'name': f"Transferred from {request.from_email}", 'mimeType': 'application/vnd.google-apps.folder'},
+            fields='id'
+        ).execute()
+        folder_id = folder['id']
 
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES,
-        subject=from_email
-    )
-    service = build('drive', 'v3', credentials=credentials)
+        query = f"'{request.from_email}' in owners and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
+        processed = []
+        errors = []
 
-    # Create a new parent folder for everything we move
-    folder = service.files().create(
-        body={'name': f"Transferred from {from_email}",
-              'mimeType': 'application/vnd.google-apps.folder'},
-        fields='id'
-    ).execute()
-    folder_id = folder['id']
+        resp = service.files().list(q=query, fields="files(id, parents)").execute()
+        for file in resp.get('files', []):
+            try:
+                parents = file.get('parents', [])
+                if folder_id not in parents:
+                    service.files().update(
+                        fileId=file['id'], addParents=folder_id,
+                        removeParents=','.join(parents), fields='id, parents'
+                    ).execute()
+                recursively_transfer(service, file['id'], request.to_email, processed, errors)
+            except Exception as e:
+                errors.append({"file_id": file['id'], "error": str(e)})
 
-    query = (
-        f"'{from_email}' in owners and trashed = false "
-        f"and mimeType = 'application/vnd.google-apps.folder'"
-    )
-    processed_count = [0]
-    error_log = []
-
-    # Process each top-level folder
-    resp = service.files().list(q=query, fields="files(id, parents)").execute()
-    for file in resp.get('files', []):
-        try:
-            # Move into our new parent
-            parents = file.get('parents', [])
-            if folder_id not in parents:
-                service.files().update(
-                    fileId=file['id'],
-                    addParents=folder_id,
-                    removeParents=','.join(parents),
-                    fields='id, parents'
-                ).execute()
-
-            # Transfer ownership of folder and its contents
-            recursively_transfer(service, file['id'], to_email, processed_count, error_log)
-
-        except Exception as e:
-            error_log.append({"file_id": file['id'], "error": str(e)})
-
-    return {
-        "status": "success",
-        "message": f"Transferred owned folders and contents from {from_email} to {to_email}",
-        "folder_id": folder_id,
-        "files_processed": processed_count[0],
-        "errors": error_log
-    }
+        logger.info(f"Transfer completed: {len(processed)} files, {len(errors)} errors")
+        return {
+            "status": "success",
+            "message": f"Transferred folders from {request.from_email} to {request.to_email}",
+            "folder_id": folder_id,
+            "files_processed": len(processed),
+            "errors": errors
+        }
+    except Exception as e:
+        logger.error(f"Transfer failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Transfer failed: {str(e)}")
 
 @app.post("/transfer-single-file")
-def transfer_single_file(request: SingleFileTransferRequest):
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES,
-        subject=request.from_email
-    )
-    service = build('drive', 'v3', credentials=credentials)
-
-    processed = []
-    errors = []
-
-    # This will handle both a single file or a folder + its nested children
-    recursively_transfer(service, request.file_id, request.to_email, processed, errors)
-
-    return {
-        "status": "complete",
-        "total_transferred": len(processed),
-        "errors": errors
-    }
+def transfer_single_file(request: SingleFileTransferRequest, _: bool = Depends(verify_bearer_token)):
+    try:
+        service = get_drive_service(request.from_email)
+        processed = []
+        errors = []
+        
+        recursively_transfer(service, request.file_id, request.to_email, processed, errors)
+        
+        logger.info(f"Single file transfer: {len(processed)} files transferred")
+        return {"status": "complete", "total_transferred": len(processed), "errors": errors}
+    except Exception as e:
+        logger.error(f"Single file transfer failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Transfer failed: {str(e)}")
 
 @app.post("/replace-shared-user")
-def replace_shared_user(request: ReplaceShareRequest):
-    from_email = request.from_email
-    to_email = request.to_email
+def replace_shared_user(request: ReplaceShareRequest, _: bool = Depends(verify_bearer_token)):
+    try:
+        service = get_drive_service(request.from_email)
+        query = f"('{request.from_email}' in readers or '{request.from_email}' in writers) and trashed = false"
+        page_token = None
+        updated_count = 0
+        skipped_count = 0
+        errors = []
 
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES,
-        subject=from_email
-    )
-    service = build('drive', 'v3', credentials=credentials)
+        while True:
+            resp = service.files().list(
+                q=query, fields="nextPageToken, files(id, permissions)", pageToken=page_token
+            ).execute()
 
-    query = f"('{from_email}' in readers or '{from_email}' in writers) and trashed = false"
-    page_token = None
-    updated_count = 0
-    skipped_count = 0
+            for file in resp.get('files', []):
+                perms = file.get('permissions', [])
+                from_perm = next((p for p in perms if p.get('emailAddress') == request.from_email), None)
+                
+                if not from_perm:
+                    skipped_count += 1
+                    continue
 
-    while True:
-        resp = service.files().list(
-            q=query,
-            fields="nextPageToken, files(id, permissions)",
-            pageToken=page_token
-        ).execute()
+                try:
+                    service.permissions().create(
+                        fileId=file['id'],
+                        body={'type': 'user', 'role': from_perm['role'], 'emailAddress': request.to_email},
+                        fields='id'
+                    ).execute()
+                    service.permissions().delete(fileId=file['id'], permissionId=from_perm['id']).execute()
+                    updated_count += 1
+                except Exception as e:
+                    skipped_count += 1
+                    errors.append({"file_id": file['id'], "error": str(e)})
+                    logger.warning(f"Failed to replace user on file {file['id']}: {e}")
 
-        for file in resp.get('files', []):
-            perms = file.get('permissions', [])
-            from_perm = next((p for p in perms if p.get('emailAddress') == from_email), None)
-            if not from_perm:
-                skipped_count += 1
-                continue
-            try:
-                service.permissions().create(
-                    fileId=file['id'],
-                    body={'type': 'user', 'role': from_perm['role'], 'emailAddress': to_email},
-                    fields='id'
-                ).execute()
-                service.permissions().delete(
-                    fileId=file['id'], permissionId=from_perm['id']
-                ).execute()
-                updated_count += 1
-            except:
-                skipped_count += 1
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
 
-        page_token = resp.get('nextPageToken')
-        if not page_token:
-            break
-
-    return {"status": "done", "updated": updated_count, "skipped": skipped_count}
+        logger.info(f"User replacement: {updated_count} updated, {skipped_count} skipped")
+        return {"status": "complete", "updated": updated_count, "skipped": skipped_count, "errors": errors}
+    except Exception as e:
+        logger.error(f"User replacement failed: {e}")
+        raise HTTPException(status_code=500, detail=f"User replacement failed: {str(e)}")
 
 @app.get("/download/{file_id}")
 def download_page(file_id: str):
     file_name = f"shared_files_{file_id}.csv"
     file_path = os.path.join(DOWNLOAD_DIR, file_name)
+    
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found or expired")
 
     html = f"""
-    <html><head><script>
-      window.onload = function() {{
-        const link = document.createElement('a');
-        link.href = '/files/{file_name}';
-        link.download = '{file_name}';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-      }};
-    </script></head>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Download {file_name}</title>
+        <script>
+            window.onload = function() {{
+                const link = document.createElement('a');
+                link.href = '/files/{file_name}';
+                link.download = '{file_name}';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }};
+        </script>
+    </head>
     <body>
-      <p>If download doesn’t start automatically, <a href="/files/{file_name}">click here</a>.</p>
-    </body></html>
+        <h2>Google Drive Audit Report</h2>
+        <p>Download should start automatically.</p>
+        <p>If not, <a href="/files/{file_name}">click here</a>.</p>
+    </body>
+    </html>
     """
     return HTMLResponse(content=html)
 
-@app.get("/")
-def root():
-    return {"status": "Drive Audit API is running"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

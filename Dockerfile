@@ -1,19 +1,20 @@
-# Dockerfile
 FROM python:3.10-slim
 
-# Set working directory
-WORKDIR /app
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --shell /bin/bash app
 
-# Copy requirements and install
+WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the code
-COPY . .
+COPY main.py ./
+RUN mkdir -p /app/downloads && chown -R app:app /app
 
-# Expose port
+USER app
 EXPOSE 8000
 
-# Run FastAPI app
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Drive Audit Panel</title>
+    <style>
+        body {
+            font-family: 'Google Sans', Arial, sans-serif;
+            margin: 0;
+            padding: 16px;
+            background-color: #f8f9fa;
+        }
+        
+        .section {
+            background: white;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .section h3 {
+            margin: 0 0 12px 0;
+            color: #1a73e8;
+            font-size: 16px;
+        }
+        
+        .button {
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            width: 100%;
+            margin-bottom: 8px;
+        }
+        
+        .button:hover {
+            background-color: #1557b0;
+        }
+        
+        .button:disabled {
+            background-color: #dadce0;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            padding: 8px;
+            border-radius: 4px;
+            margin-top: 8px;
+            font-size: 12px;
+        }
+        
+        .status.success {
+            background-color: #e8f5e8;
+            color: #137333;
+        }
+        
+        .status.error {
+            background-color: #fce8e6;
+            color: #d93025;
+        }
+        
+        .status.info {
+            background-color: #e8f0fe;
+            color: #1a73e8;
+        }
+        
+        .progress {
+            display: none;
+            text-align: center;
+            padding: 16px;
+        }
+        
+        .spinner {
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #1a73e8;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 8px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .description {
+            font-size: 12px;
+            color: #5f6368;
+            margin-bottom: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="section">
+        <h3>📊 User File Audit</h3>
+        <div class="description">
+            Generate CSV reports of files users have access to (excluding owned files).
+        </div>
+        <button class="button" onclick="runAudit()">Run Audit for All Users</button>
+        <div id="auditStatus"></div>
+    </div>
+    
+    <div class="section">
+        <h3>📁 Folder Transfer</h3>
+        <div class="description">
+            Transfer ownership of all folders from one user to another.
+        </div>
+        <button class="button" onclick="transferFolders()">Transfer All Folders</button>
+        <div id="transferStatus"></div>
+    </div>
+    
+    <div class="section">
+        <h3>📄 Single File Transfer</h3>
+        <div class="description">
+            Transfer ownership of specific files or folders.
+        </div>
+        <button class="button" onclick="transferSingleFiles()">Transfer Single Files</button>
+        <div id="singleTransferStatus"></div>
+    </div>
+    
+    <div class="section">
+        <h3>🔄 Replace Shared User</h3>
+        <div class="description">
+            Replace one user's access with another user across all shared files.
+        </div>
+        <button class="button" onclick="replaceSharedUser()">Replace Shared Users</button>
+        <div id="replaceStatus"></div>
+    </div>
+    
+    <div class="progress" id="progressIndicator">
+        <div class="spinner"></div>
+        <div>Processing...</div>
+    </div>
+
+    <script>
+        function showProgress() {
+            document.getElementById('progressIndicator').style.display = 'block';
+            const buttons = document.querySelectorAll('.button');
+            buttons.forEach(btn => btn.disabled = true);
+        }
+        
+        function hideProgress() {
+            document.getElementById('progressIndicator').style.display = 'none';
+            const buttons = document.querySelectorAll('.button');
+            buttons.forEach(btn => btn.disabled = false);
+        }
+        
+        function showStatus(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        function runAudit() {
+            showProgress();
+            showStatus('auditStatus', 'Starting audit process...', 'info');
+            
+            google.script.run
+                .withSuccessHandler(function(result) {
+                    hideProgress();
+                    const count = result.length;
+                    showStatus('auditStatus', 
+                        `✅ Audit completed! Generated ${count} reports. Check the "Drive File Audit" sheet for download links.`, 
+                        'success'
+                    );
+                })
+                .withFailureHandler(function(error) {
+                    hideProgress();
+                    showStatus('auditStatus', `❌ Audit failed: ${error.message}`, 'error');
+                })
+                .runAuditForAll();
+        }
+        
+        function transferFolders() {
+            showProgress();
+            showStatus('transferStatus', 'Starting folder transfer...', 'info');
+            
+            google.script.run
+                .withSuccessHandler(function(result) {
+                    hideProgress();
+                    const successCount = result.filter(r => r.status === 'Success').length;
+                    const failCount = result.filter(r => r.status === 'Failed').length;
+                    showStatus('transferStatus', 
+                        `✅ Transfer completed! ${successCount} successful, ${failCount} failed. Check the "Folder Transfer" sheet for details.`, 
+                        successCount > 0 ? 'success' : 'error'
+                    );
+                })
+                .withFailureHandler(function(error) {
+                    hideProgress();
+                    showStatus('transferStatus', `❌ Transfer failed: ${error.message}`, 'error');
+                })
+                .transferFoldersForAll();
+        }
+        
+        function transferSingleFiles() {
+            showProgress();
+            showStatus('singleTransferStatus', 'Starting single file transfers...', 'info');
+            
+            google.script.run
+                .withSuccessHandler(function(result) {
+                    hideProgress();
+                    const successCount = result.filter(r => r.status === 'Success').length;
+                    const failCount = result.filter(r => r.status === 'Failed').length;
+                    showStatus('singleTransferStatus', 
+                        `✅ Transfer completed! ${successCount} successful, ${failCount} failed. Check the "Single File Transfer" sheet for details.`, 
+                        successCount > 0 ? 'success' : 'error'
+                    );
+                })
+                .withFailureHandler(function(error) {
+                    hideProgress();
+                    showStatus('singleTransferStatus', `❌ Transfer failed: ${error.message}`, 'error');
+                })
+                .transferSingleFileForAll();
+        }
+        
+        function replaceSharedUser() {
+            showProgress();
+            showStatus('replaceStatus', 'Starting user replacement...', 'info');
+            
+            google.script.run
+                .withSuccessHandler(function(result) {
+                    hideProgress();
+                    showStatus('replaceStatus', 
+                        `✅ User replacement completed! Check the sheets for details.`, 
+                        'success'
+                    );
+                })
+                .withFailureHandler(function(error) {
+                    hideProgress();
+                    showStatus('replaceStatus', `❌ User replacement failed: ${error.message}`, 'error');
+                })
+                .replaceSharedUserForAll();
+        }
+    </script>
+</body>
+</html>
