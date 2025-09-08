@@ -10,7 +10,7 @@ services:
       - EXTERNAL_BASE_URL=${EXTERNAL_BASE_URL}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
-      - ./downloads:/app/downloads
+      - ./downloads:/app/downloads:rw
       - ./drive-audit-service.json:/app/drive-audit-service.json:ro
     restart: unless-stopped
     healthcheck:
