@@ -26,11 +26,14 @@ mkdir -p downloads
 
 echo "Checking port 8000..."
 # Kill any process using port 8000
-sudo lsof -ti:8000 | xargs -r sudo kill -9
+sudo netstat -tlnp | grep :8000 | awk '{print $7}' | cut -d'/' -f1 | xargs -r sudo kill -9
 
 # Stop and remove any existing containers
 docker compose down 2>/dev/null || true
 docker container prune -f
+
+# Kill any remaining processes on port 8000
+sudo fuser -k 8000/tcp 2>/dev/null || true
 
 echo "Building Docker image..."
 docker build -t drive-audit-api .
