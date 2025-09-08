@@ -28,7 +28,7 @@ echo "Building Docker image..."
 docker build -t drive-audit-api .
 
 echo "Starting services..."
-docker-compose up -d
+docker compose up -d
 
 echo "Waiting for service..."
 sleep 10
@@ -36,6 +36,6 @@ sleep 10
 if curl -f http://localhost:8000/health > /dev/null 2>&1; then
     echo "Deployment successful! API running at http://localhost:8000"
 else
-    echo "Health check failed. Check logs: docker-compose logs"
+    echo "Health check failed. Check logs: docker compose logs"
     exit 1
 fi
