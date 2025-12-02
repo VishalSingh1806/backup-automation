@@ -2,8 +2,10 @@ import csv
 import os
 import threading
 import time
+import uuid
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 import logging
@@ -13,6 +15,19 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = FastAPI(title="Google Drive Audit API", version="1.0.0")
+
+# Job tracking for async operations
+audit_jobs = {}
+
+# Configure CORS to allow requests from Google Apps Script
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (Google Apps Script)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allow all headers including Authorization
+)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -125,31 +140,33 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/audit-user")
-def audit_user(request: AuditRequest, http_request: Request, _: bool = Depends(verify_bearer_token)):
+def process_audit_async(job_id, user_email, base_url):
+    """Background function to process audit"""
     try:
-        user_email = request.user_email
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
         file_id = f"{user_email.replace('@', '_')}_{timestamp}"
         file_name = f"shared_files_{file_id}.csv"
         file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
+        audit_jobs[job_id]["status"] = "processing"
+        audit_jobs[job_id]["file_id"] = file_id
+
         service = get_drive_service(user_email)
         query = f"('{user_email}' in readers or '{user_email}' in writers) and not '{user_email}' in owners and trashed = false"
         total_files = 0
-        
+
         with open(file_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(["File Name", "File ID", "Owner", "Type", "Last Modified"])
             page_token = None
-            
+
             while True:
                 results = service.files().list(
-                    q=query, pageSize=100,
+                    q=query, pageSize=1000,
                     fields="nextPageToken, files(id, name, owners, mimeType, modifiedTime)",
                     pageToken=page_token
                 ).execute()
-                
+
                 for file in results.get('files', []):
                     writer.writerow([
                         file.get('name', ''),
@@ -159,25 +176,63 @@ def audit_user(request: AuditRequest, http_request: Request, _: bool = Depends(v
                         file.get('modifiedTime', '')
                     ])
                     total_files += 1
-                
+
+                # Update progress
+                audit_jobs[job_id]["files_processed"] = total_files
+
                 page_token = results.get('nextPageToken')
                 if not page_token:
                     break
 
         schedule_file_deletion(file_path, delay=300)
 
-        base_url = EXTERNAL_BASE_URL.rstrip('/') if EXTERNAL_BASE_URL else f"{http_request.url.scheme}://{http_request.headers.get('host', http_request.url.netloc)}"
-        
+        audit_jobs[job_id]["status"] = "completed"
+        audit_jobs[job_id]["total_files"] = total_files
+        audit_jobs[job_id]["download_link"] = f"{base_url}/download/{file_id}"
+        audit_jobs[job_id]["completed_at"] = datetime.now().isoformat()
+
         logger.info(f"Audit completed for {user_email}: {total_files} files")
-        return {
-            "status": "success",
-            "file_id": file_id,
-            "total_files": total_files,
-            "download_link": f"{base_url}/download/{file_id}"
-        }
     except Exception as e:
         logger.error(f"Audit failed for {user_email}: {e}")
-        raise HTTPException(status_code=500, detail=f"Audit failed: {str(e)}")
+        audit_jobs[job_id]["status"] = "failed"
+        audit_jobs[job_id]["error"] = str(e)
+
+@app.post("/audit-user")
+def audit_user(request: AuditRequest, http_request: Request, _: bool = Depends(verify_bearer_token)):
+    try:
+        user_email = request.user_email
+        job_id = str(uuid.uuid4())
+
+        base_url = EXTERNAL_BASE_URL.rstrip('/') if EXTERNAL_BASE_URL else f"{http_request.url.scheme}://{http_request.headers.get('host', http_request.url.netloc)}"
+
+        # Initialize job status
+        audit_jobs[job_id] = {
+            "status": "queued",
+            "user_email": user_email,
+            "files_processed": 0,
+            "created_at": datetime.now().isoformat()
+        }
+
+        # Start background thread
+        thread = threading.Thread(target=process_audit_async, args=(job_id, user_email, base_url), daemon=True)
+        thread.start()
+
+        logger.info(f"Audit job {job_id} started for {user_email}")
+        return {
+            "status": "queued",
+            "job_id": job_id,
+            "message": "Audit job started. Use /audit-status/{job_id} to check progress."
+        }
+    except Exception as e:
+        logger.error(f"Failed to start audit for {user_email}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start audit: {str(e)}")
+
+@app.get("/audit-status/{job_id}")
+def get_audit_status(job_id: str, _: bool = Depends(verify_bearer_token)):
+    if job_id not in audit_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return audit_jobs[job_id]
 
 @app.post("/transfer-owned-files")
 def transfer_owned_files(request: TransferRequest, _: bool = Depends(verify_bearer_token)):

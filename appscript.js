@@ -31,6 +31,32 @@ function openAuditSidebar() {
 }
 
 /**
+ * Polls job status until completion
+ */
+function pollJobStatus_(jobId, maxAttempts = 120) {  // 120 * 3s = 6 minutes max
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const status = httpJsonGet_(`${getBaseUrl_()}/audit-status/${jobId}`);
+
+      if (status.status === 'completed') {
+        return status;
+      } else if (status.status === 'failed') {
+        throw new Error(status.error || 'Audit failed');
+      }
+
+      // Still processing, wait 3 seconds before next poll
+      Utilities.sleep(3000);
+    } catch (e) {
+      if (attempt === maxAttempts - 1) {
+        throw e;
+      }
+      Utilities.sleep(3000);
+    }
+  }
+  throw new Error('Timeout: Audit took too long to complete');
+}
+
+/**
  * Runs audit for all users and returns an array of download links.
  */
 function runAuditForAll() {
@@ -42,7 +68,14 @@ function runAuditForAll() {
     const email = data[i][0];
     if (!email) continue;
     try {
-      const result = httpJsonPost_(`${getBaseUrl_()}/audit-user`, { user_email: email });
+      // Start the audit job
+      sheet.getRange(i+1, 2).setValue('⏳ Processing...');
+      const jobResponse = httpJsonPost_(`${getBaseUrl_()}/audit-user`, { user_email: email });
+      const jobId = jobResponse.job_id;
+
+      // Poll for completion
+      const result = pollJobStatus_(jobId);
+
       sheet.getRange(i+1, 2).setValue('✅ Ready');
       sheet.getRange(i+1, 3).setValue(new Date());
       sheet.getRange(i+1, 4).setFormula(`=HYPERLINK("${result.download_link}","Download")`);
@@ -116,7 +149,43 @@ function transferSingleFileForAll() {
 }
 
 /**
- * HTTP helper with retries and bearer auth
+ * HTTP GET helper with retries and bearer auth
+ */
+function httpJsonGet_(url) {
+  const maxAttempts = 3;
+  let attempt = 0;
+  let lastErr = null;
+  while (attempt < maxAttempts) {
+    try {
+      const resp = UrlFetchApp.fetch(url, {
+        method: 'get',
+        headers: getBearerToken_() ? { Authorization: `Bearer ${getBearerToken_()}` } : {},
+        muteHttpExceptions: true,
+        timeout: 30000  // 30 seconds for status checks
+      });
+      const status = resp.getResponseCode();
+      const text = resp.getContentText();
+      if (status >= 200 && status < 300) {
+        return JSON.parse(text || '{}');
+      }
+      // retry on 429/5xx
+      if (status === 429 || status >= 500) {
+        Utilities.sleep(Math.pow(2, attempt) * 500);
+        attempt++;
+        continue;
+      }
+      throw new Error(`HTTP ${status}: ${text}`);
+    } catch (e) {
+      lastErr = e;
+      Utilities.sleep(Math.pow(2, attempt) * 500);
+      attempt++;
+    }
+  }
+  throw lastErr || new Error('Request failed');
+}
+
+/**
+ * HTTP POST helper with retries and bearer auth
  */
 function httpJsonPost_(url, body) {
   const maxAttempts = 3;
@@ -129,7 +198,8 @@ function httpJsonPost_(url, body) {
         contentType: 'application/json',
         headers: getBearerToken_() ? { Authorization: `Bearer ${getBearerToken_()}` } : {},
         payload: JSON.stringify(body),
-        muteHttpExceptions: true
+        muteHttpExceptions: true,
+        timeout: 360000  // 6 minutes (maximum allowed by Google Apps Script)
       });
       const status = resp.getResponseCode();
       const text = resp.getContentText();
